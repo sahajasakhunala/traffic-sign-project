@@ -14,26 +14,25 @@ from torchvision import datasets, transforms
 from .model import TrafficSignCNN
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR   = os.path.join("data", "Indian_Dataset")
-MODEL_DIR  = "models"
+DATA_DIR   = "/content/drive/MyDrive/TrafficSign/Indian-Traffic Sign-Dataset/Images"
+MODEL_DIR  = "/content/drive/MyDrive/TrafficSign/models"
 MODEL_PATH = os.path.join(MODEL_DIR, "traffic_sign_cnn.pth")
 LOG_PATH   = os.path.join(MODEL_DIR, "training_log.csv")
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 IMAGE_SIZE        = 64
 BATCH_SIZE        = 64
-LR                = 3e-4          # UPDATED: Lower base LR; warmup handles ramp-up
-EPOCHS            = 30            # UPDATED: More epochs — Indian data benefits from longer training
-WARMUP_EPOCHS     = 3             # UPDATED: Linear warmup to stabilise early gradient norms
+LR                = 1e-3            # Standard Adam LR — warmup ramps into it
+EPOCHS            = 10              # Initial test run — bump to 40 after verifying paths/GPU
+WARMUP_EPOCHS     = 3               # Linear warmup for stable early training
 VAL_SPLIT         = 0.15
-EARLY_STOP_PAT    = 8             # UPDATED: More patience — Indian dataset is noisier
-GRAD_CLIP         = 1.0           # UPDATED: Tighter clip for stability on noisy labels
-NUM_WORKERS       = min(4, os.cpu_count() or 1)
+EARLY_STOP_PAT    = 10              # Patient — cosine LR improves late
+GRAD_CLIP         = 2.0             # Moderate clip
+NUM_WORKERS       = 8               # T4 Colab has enough CPU cores to feed GPU
 SEED              = 42
-LABEL_SMOOTHING   = 0.10          # UPDATED: Stronger smoothing for noisy/ambiguous signs
-MIXUP_ALPHA       = 0.3           # UPDATED: Mixup regularisation (0 = disabled)
-CUTMIX_ALPHA      = 1.0           # UPDATED: CutMix regularisation (0 = disabled)
-USE_WEIGHTED_SAMPLER = True       # UPDATED: Fix class-imbalance with per-sample weights
+LABEL_SMOOTHING   = 0.05            # Mild smoothing — just enough for noisy labels
+MIXUP_ALPHA       = 0.2             # Gentle mixup — regularises without destroying signal
+USE_WEIGHTED_SAMPLER = True         # Fix class-imbalance
 
 # ── Device ─────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,39 +45,43 @@ if device.type == "cuda":
 
 
 # ── Transforms ─────────────────────────────────────────────────────────────────
-# UPDATED: Heavier augmentation targeting real Indian road conditions:
-#   • Stronger colour jitter  → handles dust haze, glare, and mixed lighting
-#   • GaussianBlur            → motion blur from fast-moving vehicles
-#   • RandomPerspective       → signs viewed at sharp angles (elevated, tilted posts)
-#   • RandomGrayscale         → teaches colour-invariant shape features
-#   • RandomErasing           → occlusion by vehicles, foliage, stickers
+# Balanced augmentation: enough variety for robustness without destroying
+# the signal that the model needs to learn from.
+#
+# REMOVED vs previous version:
+#   - GaussianBlur        → Was smearing small sign details (text, arrows)
+#   - RandomGrayscale     → Colour IS a key feature for traffic signs
+#   - RandomPerspective   → Redundant with RandomAffine; combined effect was too harsh
+#   - RandomErasing       → Redundant with Mixup
+#   - CutMix              → Redundant with Mixup; combined effect was over-regularizing
+#
+# KEPT / TUNED:
+#   - Moderate ColorJitter → Handles lighting variation without extreme distortion
+#   - RandomAffine         → Position/scale/shear variation for realistic viewing angles
+#   - RandomCrop from oversize → Natural spatial jitter
+#   - Very low HorizontalFlip → Most traffic signs are directional
 train_transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE + 8, IMAGE_SIZE + 8)),   # slight oversize for random crop
-    transforms.RandomCrop(IMAGE_SIZE),                      # random-crop replaces simple resize
-    transforms.RandomHorizontalFlip(p=0.1),                 # most signs are asymmetric; keep low
-    transforms.RandomRotation(degrees=20),                  # UPDATED: wider rotation
+    transforms.Resize((IMAGE_SIZE + 8, IMAGE_SIZE + 8)),
+    transforms.RandomCrop(IMAGE_SIZE),
+    transforms.RandomHorizontalFlip(p=0.05),           # Very rare — signs are directional
+    transforms.RandomRotation(degrees=15),              # Moderate tilt
     transforms.RandomAffine(
         degrees=0,
-        translate=(0.12, 0.12),                             # UPDATED: slightly more shift
-        scale=(0.85, 1.15),                                 # UPDATED: wider scale range
-        shear=8,                                            # UPDATED: more shear
+        translate=(0.10, 0.10),
+        scale=(0.90, 1.10),
+        shear=5,
     ),
-    transforms.RandomPerspective(distortion_scale=0.3, p=0.4),  # UPDATED: perspective warp
     transforms.ColorJitter(
-        brightness=0.5,                                     # UPDATED: stronger — sunlight/shadow
-        contrast=0.4,                                       # UPDATED
-        saturation=0.4,                                     # UPDATED
-        hue=0.08,                                           # UPDATED
+        brightness=0.3,
+        contrast=0.3,
+        saturation=0.3,
+        hue=0.05,
     ),
-    transforms.RandomGrayscale(p=0.08),                    # UPDATED: colour-invariant features
-    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),   # UPDATED: motion/rain blur
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     ),
-    # UPDATED: Random erasing simulates stickers, damage, partial occlusion
-    transforms.RandomErasing(p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.0), value=0),
 ])
 
 val_transform = transforms.Compose([
@@ -135,12 +138,12 @@ def stratified_split(
     return train_indices, val_indices
 
 
-# UPDATED: Builds a WeightedRandomSampler to over-sample minority classes.
 def make_weighted_sampler(dataset: TransformSubset) -> WeightedRandomSampler:
+    """Over-sample minority classes using inverse-frequency weights with sqrt damping."""
     labels          = dataset.get_labels()
     class_counts    = collections.Counter(labels)
-    num_classes     = len(class_counts)
-    class_weights   = {cls: 1.0 / count for cls, count in class_counts.items()}
+    # sqrt damping: pure inverse-frequency is too aggressive for mildly imbalanced data
+    class_weights   = {cls: 1.0 / math.sqrt(count) for cls, count in class_counts.items()}
     sample_weights  = [class_weights[lbl] for lbl in labels]
     sampler = WeightedRandomSampler(
         weights     = sample_weights,
@@ -170,7 +173,6 @@ def build_loaders(
         persistent_workers = (NUM_WORKERS > 0),
     )
 
-    # UPDATED: Replace shuffle=True with a class-balancing sampler
     if USE_WEIGHTED_SAMPLER:
         sampler      = make_weighted_sampler(train_set)
         train_loader = DataLoader(train_set, sampler=sampler, **_loader_kwargs)
@@ -186,11 +188,15 @@ def build_loaders(
     return train_loader, val_loader, num_classes, class_names
 
 
-# ── Mixup / CutMix helpers ─────────────────────────────────────────────────────
-# UPDATED: Mixup and CutMix are strong regularisers for small/noisy datasets.
+# ── Mixup helper ───────────────────────────────────────────────────────────────
+# Only Mixup is used — CutMix was redundant and together they over-regularized.
+# With alpha=0.2 the mixing is gentle: most of the time lam ≈ 0.8–1.0, meaning
+# one image dominates and the other adds subtle noise.
 def mixup_data(x, y, alpha: float, device: torch.device):
     """Returns mixed inputs, pairs of targets, and lambda."""
-    lam = torch.distributions.Beta(alpha, alpha).sample().item() if alpha > 0 else 1.0
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
     batch_size = x.size(0)
     index      = torch.randperm(batch_size, device=device)
     mixed_x    = lam * x + (1 - lam) * x[index]
@@ -198,41 +204,19 @@ def mixup_data(x, y, alpha: float, device: torch.device):
     return mixed_x, y_a, y_b, lam
 
 
-def cutmix_data(x, y, alpha: float, device: torch.device):
-    """Returns CutMix inputs, pairs of targets, and lambda."""
-    lam   = torch.distributions.Beta(alpha, alpha).sample().item() if alpha > 0 else 1.0
-    batch = x.size(0)
-    index = torch.randperm(batch, device=device)
-
-    _, _, H, W = x.shape
-    cut_rat    = math.sqrt(1.0 - lam)
-    cut_h      = int(H * cut_rat)
-    cut_w      = int(W * cut_rat)
-
-    cx = torch.randint(W, (1,)).item()
-    cy = torch.randint(H, (1,)).item()
-    x1 = max(cx - cut_w // 2, 0)
-    x2 = min(cx + cut_w // 2, W)
-    y1 = max(cy - cut_h // 2, 0)
-    y2 = min(cy + cut_h // 2, H)
-
-    x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
-    lam = 1 - (y2 - y1) * (x2 - x1) / (H * W)
-    return x, y, y[index], lam
-
-
 def mixed_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-# ── LR schedule helpers ────────────────────────────────────────────────────────
-# UPDATED: Cosine annealing with linear warmup prevents the large early gradient
-# norms that destabilise training on the noisier Indian dataset.
+# ── LR schedule ────────────────────────────────────────────────────────────────
+# Linear warmup → cosine annealing to eta_min.
 def get_lr(epoch: int, warmup_epochs: int, total_epochs: int, base_lr: float) -> float:
+    eta_min = 1e-6
     if epoch <= warmup_epochs:
-        return base_lr * epoch / warmup_epochs
+        # Linear warmup from eta_min to base_lr
+        return eta_min + (base_lr - eta_min) * epoch / warmup_epochs
     progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-    return base_lr * (1 + math.cos(math.pi * progress)) / 2
+    return eta_min + (base_lr - eta_min) * (1 + math.cos(math.pi * progress)) / 2
 
 
 # ── Train / evaluate loops ─────────────────────────────────────────────────────
@@ -243,7 +227,15 @@ def run_epoch(
     optimizer: optim.Optimizer | None,
     device:    torch.device,
     epoch:     int = 0,
+    use_mixup: bool = False,
 ) -> tuple[float, float]:
+    """
+    One full pass over `loader`.  Pass optimizer=None for eval mode.
+
+    Key fix: training accuracy is computed on the CLEAN (un-mixed) predictions.
+    Previous code compared mixed-input predictions against original labels,
+    producing a misleadingly low training accuracy (~44%).
+    """
     training = optimizer is not None
     model.train() if training else model.eval()
 
@@ -260,15 +252,9 @@ def run_epoch(
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
-                # UPDATED: Randomly pick Mixup or CutMix per batch for variety
-                r = torch.rand(1).item()
-                if MIXUP_ALPHA > 0 and r < 0.4:
-                    images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
-                    outputs = model(images)
-                    loss    = mixed_criterion(criterion, outputs, y_a, y_b, lam)
-                elif CUTMIX_ALPHA > 0 and r < 0.7:
-                    images, y_a, y_b, lam = cutmix_data(images, labels, CUTMIX_ALPHA, device)
-                    outputs = model(images)
+                if use_mixup and MIXUP_ALPHA > 0:
+                    mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
+                    outputs = model(mixed_images)
                     loss    = mixed_criterion(criterion, outputs, y_a, y_b, lam)
                 else:
                     outputs = model(images)
@@ -277,14 +263,25 @@ def run_epoch(
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
+
+                # ── Accuracy on CLEAN inputs ──────────────────────────────────
+                # Run a quick forward on the original (un-mixed) images to get
+                # a meaningful training accuracy metric.
+                with torch.no_grad():
+                    if use_mixup and MIXUP_ALPHA > 0:
+                        clean_outputs = model(images)
+                    else:
+                        clean_outputs = outputs
+                    _, predicted = clean_outputs.max(1)
+                    correct += predicted.eq(labels).sum().item()
             else:
                 outputs = model(images)
                 loss    = criterion(outputs, labels)
+                _, predicted = outputs.max(1)
+                correct += predicted.eq(labels).sum().item()
 
             running_loss += loss.item() * images.size(0)
-            _, predicted  = outputs.max(1)
             total        += labels.size(0)
-            correct      += predicted.eq(labels).sum().item()
 
     return running_loss / total, 100.0 * correct / total
 
@@ -300,9 +297,9 @@ def main() -> None:
           + (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     print(f"  Batch size  : {BATCH_SIZE}")
     print(f"  Epochs      : {EPOCHS}  (warmup: {WARMUP_EPOCHS})")
-    print(f"  LR          : {LR}  |  weight_decay : 2e-4")
+    print(f"  LR          : {LR}  |  weight_decay : 1e-4")
     print(f"  Grad clip   : {GRAD_CLIP}  |  early-stop patience : {EARLY_STOP_PAT}")
-    print(f"  Label smooth: {LABEL_SMOOTHING}  |  Mixup α: {MIXUP_ALPHA}  |  CutMix α: {CUTMIX_ALPHA}")
+    print(f"  Label smooth: {LABEL_SMOOTHING}  |  Mixup α: {MIXUP_ALPHA}")
     print(f"  Val split   : {VAL_SPLIT:.0%}  |  seed : {SEED}")
     print("-" * 72)
 
@@ -312,12 +309,18 @@ def main() -> None:
     model     = TrafficSignCNN(num_classes=num_classes).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
-    # UPDATED: AdamW with higher weight decay outperforms Adam on smaller datasets
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=2e-4)
+    # AdamW — decoupled weight decay works better than L2 reg in Adam
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 
     best_val_acc   = 0.0
     patience_count = 0
     history: list[dict] = []
+
+    # Print parameter count for transparency
+    total_params = sum(p.numel() for p in model.parameters())
+    train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Parameters  : {total_params:,}  (trainable: {train_params:,})")
+    print("-" * 72)
 
     header = (
         f"{'Epoch':>7}  {'T-Loss':>8}  {'T-Acc':>7}  "
@@ -329,13 +332,22 @@ def main() -> None:
     for epoch in range(1, EPOCHS + 1):
         t0 = time.perf_counter()
 
-        # UPDATED: Manual LR with warmup; set before the forward pass
+        # Set LR with warmup + cosine annealing
         current_lr = get_lr(epoch, WARMUP_EPOCHS, EPOCHS, LR)
         for pg in optimizer.param_groups:
             pg["lr"] = current_lr
 
-        train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, device, epoch)
-        val_loss,   val_acc   = run_epoch(model, val_loader,   criterion, None,      device, epoch)
+        # Mixup only after warmup — let the model learn basic features first
+        use_mixup = (epoch > WARMUP_EPOCHS)
+
+        train_loss, train_acc = run_epoch(
+            model, train_loader, criterion, optimizer, device,
+            epoch=epoch, use_mixup=use_mixup,
+        )
+        val_loss, val_acc = run_epoch(
+            model, val_loader, criterion, None, device,
+            epoch=epoch, use_mixup=False,
+        )
 
         elapsed = time.perf_counter() - t0
 
