@@ -23,12 +23,12 @@ LOG_PATH   = os.path.join(MODEL_DIR, "training_log.csv")
 IMAGE_SIZE        = 64
 BATCH_SIZE        = 64
 LR                = 1e-3            # Standard Adam LR — warmup ramps into it
-EPOCHS            = 10              # Initial test run — bump to 40 after verifying paths/GPU
+EPOCHS            = 40              # Full training run
 WARMUP_EPOCHS     = 3               # Linear warmup for stable early training
 VAL_SPLIT         = 0.15
 EARLY_STOP_PAT    = 10              # Patient — cosine LR improves late
 GRAD_CLIP         = 2.0             # Moderate clip
-NUM_WORKERS       = 0               # T4 Colab has enough CPU cores to feed GPU
+NUM_WORKERS       = 2               # Start with 2; bump to 4 if stable
 SEED              = 42
 LABEL_SMOOTHING   = 0.05            # Mild smoothing — just enough for noisy labels
 MIXUP_ALPHA       = 0.2             # Gentle mixup — regularises without destroying signal
@@ -170,7 +170,7 @@ def build_loaders(
         batch_size  = BATCH_SIZE,
         num_workers = NUM_WORKERS,
         pin_memory  = (device.type == "cuda"),
-        persistent_workers = False,
+        persistent_workers = (NUM_WORKERS > 0),
     )
 
     if USE_WEIGHTED_SAMPLER:
@@ -180,9 +180,6 @@ def build_loaders(
         train_loader = DataLoader(train_set, shuffle=True, **_loader_kwargs)
 
     val_loader = DataLoader(val_set, shuffle=False, **_loader_kwargs)
-
-    print("Train batches:", len(train_loader))
-    print("Val batches:", len(val_loader))
 
     print(f"  Dataset   : {data_dir}")
     print(f"  Classes   : {num_classes}")
@@ -246,18 +243,10 @@ def run_epoch(
     correct      = 0
     total        = 0
 
-    import time
-    batch_start = time.time()
-
     ctx = torch.enable_grad() if training else torch.no_grad()
 
     with ctx:
-        for batch_idx, (images, labels) in enumerate(loader):
-            if batch_idx % 10 == 0:
-                print(
-                    f"Batch {batch_idx}/{len(loader)} "
-                    f"elapsed={time.time()-batch_start:.1f}s"
-                )
+        for images, labels in loader:
             
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -353,7 +342,6 @@ def main() -> None:
         # Mixup only after warmup — let the model learn basic features first
         use_mixup = (epoch > WARMUP_EPOCHS)
 
-        print(f"DEBUG: About to call run_epoch() for epoch {epoch}")
         train_loss, train_acc = run_epoch(
             model, train_loader, criterion, optimizer, device,
             epoch=epoch, use_mixup=use_mixup,
