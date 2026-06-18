@@ -258,6 +258,9 @@ def run_epoch(
                     f"Batch {batch_idx}/{len(loader)} "
                     f"elapsed={time.time()-batch_start:.1f}s"
                 )
+            
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
 
                 if training:
