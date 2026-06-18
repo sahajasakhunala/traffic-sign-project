@@ -180,7 +180,7 @@ def build_loaders(
         train_loader = DataLoader(train_set, shuffle=True, **_loader_kwargs)
 
     val_loader = DataLoader(val_set, shuffle=False, **_loader_kwargs)
-    
+
     print("Train batches:", len(train_loader))
     print("Val batches:", len(val_loader))
 
@@ -251,9 +251,15 @@ def run_epoch(
         for batch_idx, (images, labels) in enumerate(loader):
             if batch_idx % 50 == 0:
                 print(f"Batch {batch_idx}/{len(loader)}")
-                images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
+            if batch_idx == 0:
+                print(images.device)
+                print(next(model.parameters()).device)
+
+            outputs = model(images) 
+            
             if batch_idx == 0:
 
                 if training:
