@@ -259,11 +259,11 @@ def run_epoch(
                     f"elapsed={time.time()-batch_start:.1f}s"
                 )
             
-                images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
 
-                if training:
+            if training:
                     optimizer.zero_grad(set_to_none=True)
 
                     if use_mixup and MIXUP_ALPHA > 0:
