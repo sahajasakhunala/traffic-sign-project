@@ -229,6 +229,7 @@ def run_epoch(
     epoch:     int = 0,
     use_mixup: bool = False,
 ) -> tuple[float, float]:
+    print("DEBUG: Entered run_epoch")
     """
     One full pass over `loader`.  Pass optimizer=None for eval mode.
 
@@ -245,9 +246,15 @@ def run_epoch(
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        for images, labels in loader:
+        print("DEBUG: About to iterate loader")
+        for batch_idx, (images, labels) in enumerate(loader):
+            if batch_idx == 0:
+                print("DEBUG: First batch received")
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+
+            if batch_idx == 0:
+                print("DEBUG: Batch moved to GPU")
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -340,6 +347,7 @@ def main() -> None:
         # Mixup only after warmup — let the model learn basic features first
         use_mixup = (epoch > WARMUP_EPOCHS)
 
+        print(f"DEBUG: About to call run_epoch() for epoch {epoch}")
         train_loss, train_acc = run_epoch(
             model, train_loader, criterion, optimizer, device,
             epoch=epoch, use_mixup=use_mixup,
