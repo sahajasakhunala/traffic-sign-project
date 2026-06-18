@@ -264,18 +264,18 @@ def run_epoch(
 
 
             if training:
-                    optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
 
-                    if use_mixup and MIXUP_ALPHA > 0:
-                        mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
-                        outputs = model(mixed_images)
-                        loss = mixed_criterion(criterion, outputs, y_a, y_b, lam)
-                    else:
-                        outputs = model(images)
-                        loss = criterion(outputs, labels)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                    optimizer.step()
+                if use_mixup and MIXUP_ALPHA > 0:
+                    mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
+                    outputs = model(mixed_images)
+                    loss = mixed_criterion(criterion, outputs, y_a, y_b, lam)
+                else:
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
 
                 # ── Accuracy on CLEAN inputs ──────────────────────────────────
                 # Run a quick forward on the original (un-mixed) images to get
