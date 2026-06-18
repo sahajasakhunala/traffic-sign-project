@@ -316,7 +316,21 @@ def main() -> None:
 
     best_val_acc   = 0.0
     patience_count = 0
+    start_epoch    = 1
     history: list[dict] = []
+
+    if os.path.exists(MODEL_PATH):
+        print(f"\n[!] Found existing checkpoint at: {MODEL_PATH}")
+        print("    Attempting to resume training...")
+        try:
+            checkpoint = torch.load(MODEL_PATH, map_location=device)
+            model.load_state_dict(checkpoint["state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_epoch = checkpoint["epoch"] + 1
+            best_val_acc = checkpoint["val_acc"]
+            print(f"    -> Successfully resumed from epoch {start_epoch} (Best Val Acc: {best_val_acc:.2f}%)")
+        except Exception as e:
+            print(f"    -> Could not resume checkpoint: {e}. Starting training from scratch.")
 
     # Print parameter count for transparency
     total_params = sum(p.numel() for p in model.parameters())
@@ -331,7 +345,7 @@ def main() -> None:
     print(header)
     print("-" * len(header))
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch, EPOCHS + 1):
         t0 = time.perf_counter()
 
         # Set LR with warmup + cosine annealing
