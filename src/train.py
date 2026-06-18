@@ -246,9 +246,18 @@ def run_epoch(
     correct      = 0
     total        = 0
 
+    import time
+    batch_start = time.time()
+
     ctx = torch.enable_grad() if training else torch.no_grad()
+
     with ctx:
         for batch_idx, (images, labels) in enumerate(loader):
+            if batch_idx % 10 == 0:
+                print(
+                    f"Batch {batch_idx}/{len(loader)} "
+                    f"elapsed={time.time()-batch_start:.1f}s"
+                )
             if batch_idx < 5:
                 print(f"ENTERED BATCH {batch_idx}")
             if batch_idx % 50 == 0:
