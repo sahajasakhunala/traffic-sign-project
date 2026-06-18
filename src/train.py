@@ -1,8 +1,23 @@
+"""
+train.py  —  Traffic Sign Recognition (Indian Dataset)
+======================================================
+EfficientNet-B0 fine-tuned with two-phase schedule.
+
+Post-training analysis (runs automatically after training):
+  - Confusion matrix  → saved as PNG + CSV
+  - Per-class accuracy report  → printed + saved as CSV
+  - Top-N confused pairs  → printed to help diagnose errors
+
+These tell you whether remaining errors are fixable (data/augmentation)
+or inherent (classes that genuinely look alike).
+"""
+
 import csv
 import os
 import time
 import collections
 import math
+import itertools
 
 import torch
 import torch.nn as nn
@@ -10,34 +25,46 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import datasets, transforms
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 
-from .model import TrafficSignCNN
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")           # non-interactive — safe in Colab / headless
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR   = "/content/drive/MyDrive/TrafficSign/Indian-Traffic Sign-Dataset/Images"
-MODEL_DIR  = "/content/drive/MyDrive/TrafficSign/models"
-MODEL_PATH = os.path.join(MODEL_DIR, "traffic_sign_cnn.pth")
-LOG_PATH   = os.path.join(MODEL_DIR, "training_log.csv")
+DATA_DIR        = "/content/drive/MyDrive/TrafficSign/Indian-Traffic Sign-Dataset/Images"
+MODEL_DIR       = "/content/drive/MyDrive/TrafficSign/models"
+MODEL_PATH      = os.path.join(MODEL_DIR, "efficientnet_b0_traffic_sign.pth")
+LOG_PATH        = os.path.join(MODEL_DIR, "training_log.csv")
+CONF_MAT_PNG    = os.path.join(MODEL_DIR, "confusion_matrix.png")
+CONF_MAT_CSV    = os.path.join(MODEL_DIR, "confusion_matrix.csv")
+PER_CLASS_CSV   = os.path.join(MODEL_DIR, "per_class_accuracy.csv")
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
-IMAGE_SIZE        = 64
-BATCH_SIZE        = 64
-LR                = 1e-3            # Standard Adam LR — warmup ramps into it
-EPOCHS            = 40              # Full training run
-WARMUP_EPOCHS     = 3               # Linear warmup for stable early training
-VAL_SPLIT         = 0.15
-EARLY_STOP_PAT    = 10              # Patient — cosine LR improves late
-GRAD_CLIP         = 2.0             # Moderate clip
-NUM_WORKERS       = 2               # Start with 2; bump to 4 if stable
-SEED              = 42
-LABEL_SMOOTHING   = 0.05            # Mild smoothing — just enough for noisy labels
-MIXUP_ALPHA       = 0.2             # Gentle mixup — regularises without destroying signal
-USE_WEIGHTED_SAMPLER = True         # Fix class-imbalance
+IMAGE_SIZE           = 96
+BATCH_SIZE           = 64       # fits T4 at 96×96; drop to 32 if you hit CUDA OOM
+EPOCHS               = 40
+PHASE1_EPOCHS        = 5        # head-only warm-up (backbone frozen)
+LR_PHASE1            = 1e-3
+LR_PHASE2            = 5e-5
+WEIGHT_DECAY         = 1e-4
+VAL_SPLIT            = 0.15
+EARLY_STOP_PAT       = 12
+GRAD_CLIP            = 2.0
+NUM_WORKERS          = 2
+SEED                 = 42
+LABEL_SMOOTHING      = 0.05     # proven value from original run; 0.1 was unjustified
+MIXUP_ALPHA          = 0.2      # EfficientNet pretrained features are strong; 0.4 fights them
+USE_WEIGHTED_SAMPLER = True
+COSINE_T0            = 10
+COSINE_T_MULT        = 2
+TOP_CONFUSED_N       = 15       # print this many worst confused pairs
 
 # ── Device ─────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── Reproducibility ────────────────────────────────────────────────────────────
 torch.manual_seed(SEED)
 if device.type == "cuda":
     torch.cuda.manual_seed_all(SEED)
@@ -45,84 +72,48 @@ if device.type == "cuda":
 
 
 # ── Transforms ─────────────────────────────────────────────────────────────────
-# Balanced augmentation: enough variety for robustness without destroying
-# the signal that the model needs to learn from.
-#
-# REMOVED vs previous version:
-#   - GaussianBlur        → Was smearing small sign details (text, arrows)
-#   - RandomGrayscale     → Colour IS a key feature for traffic signs
-#   - RandomPerspective   → Redundant with RandomAffine; combined effect was too harsh
-#   - RandomErasing       → Redundant with Mixup
-#   - CutMix              → Redundant with Mixup; combined effect was over-regularizing
-#
-# KEPT / TUNED:
-#   - Moderate ColorJitter → Handles lighting variation without extreme distortion
-#   - RandomAffine         → Position/scale/shear variation for realistic viewing angles
-#   - RandomCrop from oversize → Natural spatial jitter
-#   - Very low HorizontalFlip → Most traffic signs are directional
+_MEAN = [0.485, 0.456, 0.406]
+_STD  = [0.229, 0.224, 0.225]
+
 train_transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE + 8, IMAGE_SIZE + 8)),
+    transforms.Resize((IMAGE_SIZE + 12, IMAGE_SIZE + 12)),
     transforms.RandomCrop(IMAGE_SIZE),
-    transforms.RandomHorizontalFlip(p=0.05),           # Very rare — signs are directional
-    transforms.RandomRotation(degrees=15),              # Moderate tilt
-    transforms.RandomAffine(
-        degrees=0,
-        translate=(0.10, 0.10),
-        scale=(0.90, 1.10),
-        shear=5,
-    ),
-    transforms.ColorJitter(
-        brightness=0.3,
-        contrast=0.3,
-        saturation=0.3,
-        hue=0.05,
-    ),
+    transforms.RandomHorizontalFlip(p=0.05),
+    transforms.RandomRotation(degrees=15),
+    transforms.RandomAffine(degrees=0, translate=(0.10, 0.10), scale=(0.88, 1.12), shear=6),
+    transforms.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.30, hue=0.06),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
+    transforms.Normalize(mean=_MEAN, std=_STD),
 ])
 
 val_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
+    transforms.Normalize(mean=_MEAN, std=_STD),
 ])
 
 
 # ── Dataset helpers ────────────────────────────────────────────────────────────
 class TransformSubset(torch.utils.data.Dataset):
-    """Wraps a Subset and applies an independent transform."""
-
-    def __init__(self, subset: torch.utils.data.Subset, transform):
+    def __init__(self, subset, transform):
         self.subset    = subset
         self.transform = transform
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.subset)
 
     def __getitem__(self, idx):
         path, label = self.subset.dataset.samples[self.subset.indices[idx]]
         from PIL import Image
-        image = Image.open(path).convert("RGB")
-        return self.transform(image), label
+        return self.transform(Image.open(path).convert("RGB")), label
 
-    def get_labels(self) -> list[int]:
-        """Return all labels — needed for WeightedRandomSampler."""
+    def get_labels(self):
         return [self.subset.dataset.samples[i][1] for i in self.subset.indices]
 
 
-def stratified_split(
-    dataset:   datasets.ImageFolder,
-    val_split: float,
-    seed:      int,
-) -> tuple[list[int], list[int]]:
+def stratified_split(dataset, val_split, seed):
     rng = torch.Generator().manual_seed(seed)
-    class_indices: dict[int, list[int]] = collections.defaultdict(list)
+    class_indices = collections.defaultdict(list)
     for idx, (_, label) in enumerate(dataset.samples):
         class_indices[label].append(idx)
 
@@ -134,29 +125,18 @@ def stratified_split(
         n_val_c = max(1, int(len(idxs) * val_split))
         val_indices.extend(idxs[:n_val_c])
         train_indices.extend(idxs[n_val_c:])
-
     return train_indices, val_indices
 
 
-def make_weighted_sampler(dataset: TransformSubset) -> WeightedRandomSampler:
-    """Over-sample minority classes using inverse-frequency weights with sqrt damping."""
-    labels          = dataset.get_labels()
-    class_counts    = collections.Counter(labels)
-    # sqrt damping: pure inverse-frequency is too aggressive for mildly imbalanced data
-    class_weights   = {cls: 1.0 / math.sqrt(count) for cls, count in class_counts.items()}
-    sample_weights  = [class_weights[lbl] for lbl in labels]
-    sampler = WeightedRandomSampler(
-        weights     = sample_weights,
-        num_samples = len(sample_weights),
-        replacement = True,
-    )
-    return sampler
+def make_weighted_sampler(dataset):
+    labels        = dataset.get_labels()
+    class_counts  = collections.Counter(labels)
+    class_weights = {c: 1.0 / math.sqrt(n) for c, n in class_counts.items()}
+    sample_w      = [class_weights[l] for l in labels]
+    return WeightedRandomSampler(weights=sample_w, num_samples=len(sample_w), replacement=True)
 
 
-def build_loaders(
-    data_dir: str,
-    val_split: float,
-) -> tuple[DataLoader, DataLoader, int, list[str]]:
+def build_loaders(data_dir, val_split):
     base_dataset = datasets.ImageFolder(root=data_dir)
     class_names  = base_dataset.classes
     num_classes  = len(class_names)
@@ -166,20 +146,18 @@ def build_loaders(
     train_set = TransformSubset(Subset(base_dataset, train_indices), train_transform)
     val_set   = TransformSubset(Subset(base_dataset, val_indices),   val_transform)
 
-    _loader_kwargs = dict(
-        batch_size  = BATCH_SIZE,
-        num_workers = NUM_WORKERS,
-        pin_memory  = (device.type == "cuda"),
+    kw = dict(
+        batch_size         = BATCH_SIZE,
+        num_workers        = NUM_WORKERS,
+        pin_memory         = (device.type == "cuda"),
         persistent_workers = (NUM_WORKERS > 0),
     )
-
     if USE_WEIGHTED_SAMPLER:
-        sampler      = make_weighted_sampler(train_set)
-        train_loader = DataLoader(train_set, sampler=sampler, **_loader_kwargs)
+        train_loader = DataLoader(train_set, sampler=make_weighted_sampler(train_set), **kw)
     else:
-        train_loader = DataLoader(train_set, shuffle=True, **_loader_kwargs)
+        train_loader = DataLoader(train_set, shuffle=True, **kw)
 
-    val_loader = DataLoader(val_set, shuffle=False, **_loader_kwargs)
+    val_loader = DataLoader(val_set, shuffle=False, **kw)
 
     print(f"  Dataset   : {data_dir}")
     print(f"  Classes   : {num_classes}")
@@ -188,99 +166,76 @@ def build_loaders(
     return train_loader, val_loader, num_classes, class_names
 
 
-# ── Mixup helper ───────────────────────────────────────────────────────────────
-# Only Mixup is used — CutMix was redundant and together they over-regularized.
-# With alpha=0.2 the mixing is gentle: most of the time lam ≈ 0.8–1.0, meaning
-# one image dominates and the other adds subtle noise.
-def mixup_data(x, y, alpha: float, device: torch.device):
-    """Returns mixed inputs, pairs of targets, and lambda."""
-    if alpha <= 0:
-        return x, y, y, 1.0
-    lam = torch.distributions.Beta(alpha, alpha).sample().item()
-    batch_size = x.size(0)
-    index      = torch.randperm(batch_size, device=device)
-    mixed_x    = lam * x + (1 - lam) * x[index]
-    y_a, y_b   = y, y[index]
-    return mixed_x, y_a, y_b, lam
+# ── Model ──────────────────────────────────────────────────────────────────────
+def build_model(num_classes):
+    model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+    return model
+
+
+def freeze_backbone(model):
+    for name, p in model.named_parameters():
+        p.requires_grad = name.startswith("classifier")
+
+
+def unfreeze_all(model):
+    for p in model.parameters():
+        p.requires_grad = True
+
+
+# ── Mixup ──────────────────────────────────────────────────────────────────────
+def mixup_data(x, y, alpha):
+    lam   = torch.distributions.Beta(alpha, alpha).sample().item()
+    index = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[index], y, y[index], lam
 
 
 def mixed_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-# ── LR schedule ────────────────────────────────────────────────────────────────
-# Linear warmup → cosine annealing to eta_min.
-def get_lr(epoch: int, warmup_epochs: int, total_epochs: int, base_lr: float) -> float:
-    eta_min = 1e-6
-    if epoch <= warmup_epochs:
-        # Linear warmup from eta_min to base_lr
-        return eta_min + (base_lr - eta_min) * epoch / warmup_epochs
-    progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-    return eta_min + (base_lr - eta_min) * (1 + math.cos(math.pi * progress)) / 2
+# ── AMP (Automatic Mixed Precision) ────────────────────────────────────────────
+# 20–50% faster on T4, less VRAM, identical accuracy.
+_use_amp = (device.type == "cuda")
+_scaler  = torch.amp.GradScaler(enabled=_use_amp)
 
 
-# ── Train / evaluate loops ─────────────────────────────────────────────────────
-def run_epoch(
-    model:     nn.Module,
-    loader:    DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer | None,
-    device:    torch.device,
-    epoch:     int = 0,
-    use_mixup: bool = False,
-) -> tuple[float, float]:
-    """
-    One full pass over `loader`.  Pass optimizer=None for eval mode.
-
-    Key fix: training accuracy is computed on the CLEAN (un-mixed) predictions.
-    Previous code compared mixed-input predictions against original labels,
-    producing a misleadingly low training accuracy (~44%).
-    """
+# ── Train / eval loop ──────────────────────────────────────────────────────────
+def run_epoch(model, loader, criterion, optimizer, use_mixup=False):
     training = optimizer is not None
     model.train() if training else model.eval()
 
-    running_loss = 0.0
-    correct      = 0
-    total        = 0
-
+    running_loss, correct, total = 0.0, 0, 0
     ctx = torch.enable_grad() if training else torch.no_grad()
 
     with ctx:
         for images, labels in loader:
-            
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-
             if training:
                 optimizer.zero_grad(set_to_none=True)
-
-                if use_mixup and MIXUP_ALPHA > 0:
-                    mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
-                    outputs = model(mixed_images)
-                    loss = mixed_criterion(criterion, outputs, y_a, y_b, lam)
-                else:
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                optimizer.step()
-
-                # ── Accuracy on CLEAN inputs ──────────────────────────────────
-                # Run a quick forward on the original (un-mixed) images to get
-                # a meaningful training accuracy metric.
-                with torch.no_grad():
+                with torch.amp.autocast(device_type=device.type, enabled=_use_amp):
                     if use_mixup and MIXUP_ALPHA > 0:
-                        clean_outputs = model(images)
+                        mx, ya, yb, lam = mixup_data(images, labels, MIXUP_ALPHA)
+                        out  = model(mx)
+                        loss = mixed_criterion(criterion, out, ya, yb, lam)
                     else:
-                        clean_outputs = outputs
-                    _, predicted = clean_outputs.max(1)
-                    correct += predicted.eq(labels).sum().item()
+                        out  = model(images)
+                        loss = criterion(out, labels)
+                _scaler.scale(loss).backward()
+                _scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                _scaler.step(optimizer)
+                _scaler.update()
+                with torch.no_grad():
+                    clean = model(images) if (use_mixup and MIXUP_ALPHA > 0) else out
+                    correct += clean.max(1)[1].eq(labels).sum().item()
             else:
-                outputs = model(images)
-                loss    = criterion(outputs, labels)
-                _, predicted = outputs.max(1)
-                correct += predicted.eq(labels).sum().item()
+                with torch.amp.autocast(device_type=device.type, enabled=_use_amp):
+                    out  = model(images)
+                    loss = criterion(out, labels)
+                correct += out.max(1)[1].eq(labels).sum().item()
 
             running_loss += loss.item() * images.size(0)
             total        += labels.size(0)
@@ -288,143 +243,400 @@ def run_epoch(
     return running_loss / total, 100.0 * correct / total
 
 
+# ── Confusion matrix + per-class analysis ─────────────────────────────────────
+def collect_predictions(model, loader):
+    """Return (all_labels, all_preds) numpy arrays over the full loader."""
+    model.eval()
+    all_labels, all_preds = [], []
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            preds  = model(images).argmax(dim=1).cpu()
+            all_preds.extend(preds.numpy())
+            all_labels.extend(labels.numpy())
+    return np.array(all_labels), np.array(all_preds)
+
+
+def compute_confusion_matrix(labels, preds, num_classes):
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for t, p in zip(labels, preds):
+        cm[t, p] += 1
+    return cm
+
+
+def plot_confusion_matrix(cm, class_names, save_path):
+    """
+    Saves a normalised confusion matrix PNG.
+    For large class counts (>20) we omit axis tick labels to keep it readable —
+    the CSV always has the full detail.
+    """
+    num_classes = len(class_names)
+    cm_norm     = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-9)
+
+    fig_side = max(10, num_classes * 0.4)
+    fig, ax  = plt.subplots(figsize=(fig_side, fig_side))
+
+    im = ax.imshow(cm_norm, interpolation="nearest", cmap="Blues", vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax.set_title("Confusion Matrix (normalised by true class)", fontsize=14, pad=12)
+    ax.set_xlabel("Predicted label", fontsize=11)
+    ax.set_ylabel("True label",      fontsize=11)
+
+    if num_classes <= 30:
+        ticks = np.arange(num_classes)
+        ax.set_xticks(ticks); ax.set_xticklabels(class_names, rotation=90, fontsize=7)
+        ax.set_yticks(ticks); ax.set_yticklabels(class_names, fontsize=7)
+        # Annotate cells only for small matrices
+        if num_classes <= 20:
+            thresh = cm_norm.max() / 2.0
+            for i, j in itertools.product(range(num_classes), range(num_classes)):
+                val = cm_norm[i, j]
+                if val > 0.01:          # skip near-zero cells to reduce clutter
+                    ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                            fontsize=6, color="white" if val > thresh else "black")
+    else:
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("Predicted label (tick labels omitted — see CSV)", fontsize=10)
+        ax.set_ylabel("True label (tick labels omitted — see CSV)",      fontsize=10)
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Confusion matrix PNG : {save_path}")
+
+
+def save_confusion_matrix_csv(cm, class_names, save_path):
+    with open(save_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["true \\ pred"] + class_names)
+        for i, row in enumerate(cm):
+            writer.writerow([class_names[i]] + row.tolist())
+    print(f"  Confusion matrix CSV : {save_path}")
+
+
+def per_class_report(cm, class_names, save_path):
+    """
+    Compute and print per-class precision, recall, F1, support.
+    Saves a CSV sorted by recall ascending (worst classes first).
+    """
+    num_classes = len(class_names)
+    rows = []
+    for i in range(num_classes):
+        tp      = cm[i, i]
+        fn      = cm[i, :].sum() - tp          # missed in true row
+        fp      = cm[:, i].sum() - tp          # false predictions in pred col
+        support = cm[i, :].sum()
+
+        recall    = tp / (tp + fn + 1e-9)
+        precision = tp / (tp + fp + 1e-9)
+        f1        = 2 * precision * recall / (precision + recall + 1e-9)
+
+        rows.append({
+            "class":     class_names[i],
+            "support":   int(support),
+            "recall_%":  round(100 * recall,    2),
+            "precision_%": round(100 * precision, 2),
+            "f1_%":      round(100 * f1,        2),
+            "tp":        int(tp),
+            "fp":        int(fp),
+            "fn":        int(fn),
+        })
+
+    # Sort worst-first by recall
+    rows_sorted = sorted(rows, key=lambda r: r["recall_%"])
+
+    # Print summary table
+    print()
+    print("  ── Per-class accuracy (sorted worst → best recall) ──")
+    hdr = f"  {'Class':<35} {'Support':>8} {'Recall':>8} {'Prec':>8} {'F1':>8}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for r in rows_sorted:
+        flag = "  ◄ POOR" if r["recall_%"] < 70 else ""
+        print(
+            f"  {r['class']:<35} {r['support']:>8} "
+            f"{r['recall_%']:>7.1f}% {r['precision_%']:>7.1f}% {r['f1_%']:>7.1f}%"
+            f"{flag}"
+        )
+
+    # Save CSV
+    with open(save_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows_sorted)
+    print(f"\n  Per-class CSV        : {save_path}")
+
+    return rows_sorted
+
+
+def top_confused_pairs(cm, class_names, n=15):
+    """
+    Print the N most-confused off-diagonal (true→predicted) pairs.
+    These are the pairs most worth investigating (more data, relabelling, etc.)
+    """
+    num_classes = len(class_names)
+    pairs = []
+    for i in range(num_classes):
+        for j in range(num_classes):
+            if i != j and cm[i, j] > 0:
+                pairs.append((cm[i, j], class_names[i], class_names[j]))
+    pairs.sort(reverse=True)
+
+    print()
+    print(f"  ── Top-{n} confused pairs (true → predicted, by count) ──")
+    print(f"  {'Count':>6}   {'True class':<35} → {'Predicted class'}")
+    print("  " + "-" * 70)
+    for count, true_cls, pred_cls in pairs[:n]:
+        print(f"  {count:>6}   {true_cls:<35}   {pred_cls}")
+
+
+def run_analysis(model, val_loader, class_names):
+    """Full post-training analysis: confusion matrix + per-class report."""
+    print()
+    print("=" * 72)
+    print("  Post-Training Analysis")
+    print("=" * 72)
+    print("  Collecting predictions on validation set…")
+
+    labels, preds = collect_predictions(model, val_loader)
+    num_classes   = len(class_names)
+    cm            = compute_confusion_matrix(labels, preds, num_classes)
+
+    # Overall accuracy (sanity check)
+    overall = 100.0 * (labels == preds).mean()
+    print(f"  Overall val accuracy  : {overall:.2f}%  (from raw predictions, no label smoothing)")
+
+    # Plots + CSVs
+    plot_confusion_matrix(cm, class_names, CONF_MAT_PNG)
+    save_confusion_matrix_csv(cm, class_names, CONF_MAT_CSV)
+
+    # Per-class report
+    per_class_rows = per_class_report(cm, class_names, PER_CLASS_CSV)
+
+    # Top confused pairs — the most actionable diagnostic
+    top_confused_pairs(cm, class_names, n=TOP_CONFUSED_N)
+
+    # Summary: how many classes are struggling?
+    poor = [r for r in per_class_rows if r["recall_%"] < 70]
+    ok   = [r for r in per_class_rows if 70 <= r["recall_%"] < 90]
+    good = [r for r in per_class_rows if r["recall_%"] >= 90]
+
+    print()
+    print("  ── Class health summary ──")
+    print(f"  ≥ 90% recall  (good)  : {len(good):>3} classes")
+    print(f"  70–90% recall (ok)    : {len(ok):>3} classes")
+    print(f"  < 70% recall  (poor)  : {len(poor):>3} classes  ◄ focus here")
+
+    if poor:
+        print()
+        print("  Classes with < 70% recall — likely causes:")
+        print("  1. Too few training samples  → collect more images")
+        print("  2. Visual ambiguity with another class  → see confused pairs above")
+        print("  3. Labelling errors in the dataset  → audit those folders")
+
+    print("=" * 72)
+
+
+# ── Checkpoint helpers ─────────────────────────────────────────────────────────
+def _save_checkpoint(model, optimizer, epoch, val_acc, val_loss, class_names, num_classes, phase="full"):
+    torch.save(
+        {
+            "epoch":       epoch,
+            "phase":       phase,        # "head" or "full" — needed for resume
+            "state_dict":  model.state_dict(),
+            "optimizer":   optimizer.state_dict(),
+            "val_acc":     val_acc,
+            "val_loss":    val_loss,
+            "class_names": class_names,
+            "num_classes": num_classes,
+            "image_size":  IMAGE_SIZE,
+            "backbone":    "efficientnet_b0",
+        },
+        MODEL_PATH,
+    )
+
+
+def _make_row(epoch, tl, ta, vl, va, lr, t, phase):
+    return {
+        "epoch": epoch, "phase": phase,
+        "train_loss": round(tl, 6), "train_acc": round(ta, 4),
+        "val_loss":   round(vl, 6), "val_acc":   round(va, 4),
+        "lr":         round(lr, 8), "time_s":    round(t,  2),
+    }
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
-def main() -> None:
+def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     print("=" * 72)
-    print("  Traffic Sign Recognition — Training (Indian Dataset)")
+    print("  Traffic Sign Recognition — EfficientNet-B0 Fine-Tuning")
     print("=" * 72)
     print(f"  Device      : {device}"
           + (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
-    print(f"  Batch size  : {BATCH_SIZE}")
-    print(f"  Epochs      : {EPOCHS}  (warmup: {WARMUP_EPOCHS})")
-    print(f"  LR          : {LR}  |  weight_decay : 1e-4")
-    print(f"  Grad clip   : {GRAD_CLIP}  |  early-stop patience : {EARLY_STOP_PAT}")
+    print(f"  Image size  : {IMAGE_SIZE}px  |  Batch: {BATCH_SIZE}")
+    print(f"  Epochs      : {EPOCHS}  (Phase 1 head-only: {PHASE1_EPOCHS})")
+    print(f"  LR P1/P2    : {LR_PHASE1} / {LR_PHASE2}  |  WD: {WEIGHT_DECAY}")
     print(f"  Label smooth: {LABEL_SMOOTHING}  |  Mixup α: {MIXUP_ALPHA}")
-    print(f"  Val split   : {VAL_SPLIT:.0%}  |  seed : {SEED}")
+    print(f"  Val split   : {VAL_SPLIT:.0%}  |  seed: {SEED}")
     print("-" * 72)
 
     train_loader, val_loader, num_classes, class_names = build_loaders(DATA_DIR, VAL_SPLIT)
     print("-" * 72)
 
-    model     = TrafficSignCNN(num_classes=num_classes).to(device)
+    model     = build_model(num_classes).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
-    # AdamW — decoupled weight decay works better than L2 reg in Adam
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-
-    best_val_acc   = 0.0
-    patience_count = 0
-    start_epoch    = 1
-    history: list[dict] = []
-
-    if os.path.exists(MODEL_PATH):
-        print(f"\n[!] Found existing checkpoint at: {MODEL_PATH}")
-        print("    Attempting to resume training...")
-        try:
-            checkpoint = torch.load(MODEL_PATH, map_location=device)
-            model.load_state_dict(checkpoint["state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            start_epoch = checkpoint["epoch"] + 1
-            best_val_acc = checkpoint["val_acc"]
-            print(f"    -> Successfully resumed from epoch {start_epoch} (Best Val Acc: {best_val_acc:.2f}%)")
-        except Exception as e:
-            print(f"    -> Could not resume checkpoint: {e}. Starting training from scratch.")
-
-    # Print parameter count for transparency
-    total_params = sum(p.numel() for p in model.parameters())
-    train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters  : {total_params:,}  (trainable: {train_params:,})")
+    print(f"  Backbone    : EfficientNet-B0 (ImageNet pretrained)")
+    print(f"  Parameters  : {sum(p.numel() for p in model.parameters()):,}")
     print("-" * 72)
 
-    header = (
-        f"{'Epoch':>7}  {'T-Loss':>8}  {'T-Acc':>7}  "
-        f"{'V-Loss':>8}  {'V-Acc':>7}  {'LR':>10}  {'Time':>7}"
-    )
-    print(header)
-    print("-" * len(header))
+    best_val_acc, patience_count = 0.0, 0
+    history: list[dict] = []
 
-    for epoch in range(start_epoch, EPOCHS + 1):
+    # ── Resume from checkpoint if available ───────────────────────────────────
+    # The checkpoint stores the epoch and phase it was saved at, so we can
+    # skip already-completed epochs and restore optimiser state exactly.
+    resume_epoch = 0          # last completed epoch (0 = fresh start)
+    resume_phase = "head"     # which phase we were in when saved
+    if os.path.exists(MODEL_PATH):
+        print(f"\n[!] Checkpoint found: {MODEL_PATH}")
+        try:
+            ckpt = torch.load(MODEL_PATH, map_location=device)
+            model.load_state_dict(ckpt["state_dict"])
+            best_val_acc  = ckpt.get("val_acc",  0.0)
+            resume_epoch  = ckpt.get("epoch",    0)
+            resume_phase  = ckpt.get("phase",    "head")
+            print(f"    Resumed from epoch {resume_epoch}  "
+                  f"phase={resume_phase}  best_val_acc={best_val_acc:.2f}%")
+            # Reload history from log so the CSV stays continuous
+            if os.path.exists(LOG_PATH):
+                with open(LOG_PATH, newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        history.append({
+                            "epoch":      int(row["epoch"]),
+                            "phase":      row["phase"],
+                            "train_loss": float(row["train_loss"]),
+                            "train_acc":  float(row["train_acc"]),
+                            "val_loss":   float(row["val_loss"]),
+                            "val_acc":    float(row["val_acc"]),
+                            "lr":         float(row["lr"]),
+                            "time_s":     float(row["time_s"]),
+                        })
+        except Exception as e:
+            print(f"    Could not load checkpoint ({e}) — starting from scratch.")
+            resume_epoch = 0
+            resume_phase = "head"
+
+    header = (f"{'Epoch':>7}  {'T-Loss':>8}  {'T-Acc':>7}  "
+              f"{'V-Loss':>8}  {'V-Acc':>7}  {'LR':>10}  {'Time':>7}  {'Phase':>7}")
+    sep = "-" * len(header)
+
+    # ── Phase 1: head only ────────────────────────────────────────────────────
+    # Skip entirely if we already finished Phase 1 before the interruption.
+    phase1_start = resume_epoch + 1 if resume_phase == "head" else PHASE1_EPOCHS + 1
+
+    print(f"\n  ── Phase 1: head-only ({PHASE1_EPOCHS} epochs) ──")
+    freeze_backbone(model)
+    print(f"  Trainable : {sum(p.numel() for p in model.parameters() if p.requires_grad):,}  (backbone frozen)")
+
+    opt1 = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                       lr=LR_PHASE1, weight_decay=WEIGHT_DECAY)
+    sch1 = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt1, T_0=PHASE1_EPOCHS, T_mult=1, eta_min=1e-6)
+
+    # Fast-forward scheduler to match the resumed epoch so LR is correct
+    for _e in range(1, phase1_start):
+        sch1.step(_e)
+
+    if phase1_start > PHASE1_EPOCHS:
+        print(f"  Phase 1 already complete — skipping.")
+    else:
+        print(f"  Resuming from epoch {phase1_start}.")
+        print(header); print(sep)
+
+    for epoch in range(phase1_start, PHASE1_EPOCHS + 1):
         t0 = time.perf_counter()
-
-        # Set LR with warmup + cosine annealing
-        current_lr = get_lr(epoch, WARMUP_EPOCHS, EPOCHS, LR)
-        for pg in optimizer.param_groups:
-            pg["lr"] = current_lr
-
-        # Mixup only after warmup — let the model learn basic features first
-        use_mixup = (epoch > WARMUP_EPOCHS)
-
-        train_loss, train_acc = run_epoch(
-            model, train_loader, criterion, optimizer, device,
-            epoch=epoch, use_mixup=use_mixup,
-        )
-        val_loss, val_acc = run_epoch(
-            model, val_loader, criterion, None, device,
-            epoch=epoch, use_mixup=False,
-        )
-
+        tl, ta = run_epoch(model, train_loader, criterion, opt1,  use_mixup=False)
+        vl, va = run_epoch(model, val_loader,   criterion, None,  use_mixup=False)
+        sch1.step(epoch)
         elapsed = time.perf_counter() - t0
+        lr      = sch1.get_last_lr()[0]
 
-        # ── Checkpoint ──────────────────────────────────────────────────────────
-        improved = val_acc > best_val_acc
-        if improved:
-            best_val_acc   = val_acc
-            patience_count = 0
-            torch.save(
-                {
-                    "epoch":       epoch,
-                    "state_dict":  model.state_dict(),
-                    "optimizer":   optimizer.state_dict(),
-                    "val_acc":     val_acc,
-                    "val_loss":    val_loss,
-                    "class_names": class_names,
-                    "num_classes": num_classes,
-                    "image_size":  IMAGE_SIZE,
-                },
-                MODEL_PATH,
-            )
+        if va > best_val_acc:
+            best_val_acc, patience_count = va, 0
+            _save_checkpoint(model, opt1, epoch, va, vl, class_names, num_classes, phase="head")
         else:
             patience_count += 1
 
-        marker = " ✓" if improved else ""
-        print(
-            f"{epoch:>6}/{EPOCHS}"
-            f"  {train_loss:>8.4f}"
-            f"  {train_acc:>6.2f}%"
-            f"  {val_loss:>8.4f}"
-            f"  {val_acc:>6.2f}%"
-            f"  {current_lr:>10.6f}"
-            f"  {elapsed:>6.1f}s"
-            f"{marker}"
-        )
+        mark = " ✓" if va == best_val_acc else ""
+        print(f"{epoch:>6}/{EPOCHS}  {tl:>8.4f}  {ta:>6.2f}%  {vl:>8.4f}  {va:>6.2f}%  {lr:>10.6f}  {elapsed:>6.1f}s  {'head':>7}{mark}")
+        history.append(_make_row(epoch, tl, ta, vl, va, lr, elapsed, "head"))
 
-        history.append({
-            "epoch":      epoch,
-            "train_loss": round(train_loss, 6),
-            "train_acc":  round(train_acc,  4),
-            "val_loss":   round(val_loss,   6),
-            "val_acc":    round(val_acc,    4),
-            "lr":         round(current_lr, 8),
-            "time_s":     round(elapsed,    2),
-        })
+    # ── Phase 2: full fine-tune ───────────────────────────────────────────────
+    # If we crashed mid-phase-2, resume_phase=="full" and we skip ahead.
+    phase2_start = (resume_epoch + 1
+                    if resume_phase == "full"
+                    else PHASE1_EPOCHS + 1)
+
+    print(f"\n  ── Phase 2: full fine-tuning (epochs {PHASE1_EPOCHS+1}–{EPOCHS}) ──")
+    unfreeze_all(model)
+    print(f"  Trainable : {sum(p.numel() for p in model.parameters()):,}  (all layers)")
+
+    opt2 = optim.AdamW(model.parameters(), lr=LR_PHASE2, weight_decay=WEIGHT_DECAY)
+    sch2 = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt2, T_0=COSINE_T0, T_mult=COSINE_T_MULT, eta_min=1e-7)
+
+    # Fast-forward scheduler
+    for _e in range(1, phase2_start - PHASE1_EPOCHS):
+        sch2.step(_e)
+
+    patience_count = 0
+    if phase2_start <= EPOCHS:
+        print(f"  Resuming from epoch {phase2_start}.")
+    print(header); print(sep)
+
+    for epoch in range(phase2_start, EPOCHS + 1):
+        t0 = time.perf_counter()
+        tl, ta = run_epoch(model, train_loader, criterion, opt2, use_mixup=True)
+        vl, va = run_epoch(model, val_loader,   criterion, None, use_mixup=False)
+        sch2.step(epoch - PHASE1_EPOCHS)
+        elapsed = time.perf_counter() - t0
+        lr      = sch2.get_last_lr()[0]
+
+        if va > best_val_acc:
+            best_val_acc, patience_count = va, 0
+            _save_checkpoint(model, opt2, epoch, va, vl, class_names, num_classes, phase="full")
+        else:
+            patience_count += 1
+
+        mark = " ✓" if va == best_val_acc else ""
+        print(f"{epoch:>6}/{EPOCHS}  {tl:>8.4f}  {ta:>6.2f}%  {vl:>8.4f}  {va:>6.2f}%  {lr:>10.6f}  {elapsed:>6.1f}s  {'full':>7}{mark}")
+        history.append(_make_row(epoch, tl, ta, vl, va, lr, elapsed, "full"))
 
         if patience_count >= EARLY_STOP_PAT:
-            print(f"\n  Early stopping triggered — no improvement for {EARLY_STOP_PAT} epochs.")
+            print(f"\n  Early stopping — no improvement for {EARLY_STOP_PAT} epochs.")
             break
 
-    # ── Save log ──────────────────────────────────────────────────────────────
-    with open(LOG_PATH, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=history[0].keys())
-        writer.writeheader()
-        writer.writerows(history)
+    # ── Save training log (full history including resumed rows) ──────────────
+    if history:
+        with open(LOG_PATH, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=history[0].keys())
+            writer.writeheader()
+            writer.writerows(history)
 
     print("=" * 72)
     print(f"  Best val accuracy : {best_val_acc:.2f}%")
     print(f"  Model saved       : {MODEL_PATH}")
     print(f"  Training log      : {LOG_PATH}")
-    print("=" * 72)
+
+    # ── Load best checkpoint for analysis ────────────────────────────────────
+    print("\n  Loading best checkpoint for post-training analysis…")
+    ckpt = torch.load(MODEL_PATH, map_location=device)
+    model.load_state_dict(ckpt["state_dict"])
+
+    run_analysis(model, val_loader, class_names)
 
 
 if __name__ == "__main__":
