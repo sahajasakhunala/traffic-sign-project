@@ -249,6 +249,8 @@ def run_epoch(
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for batch_idx, (images, labels) in enumerate(loader):
+            if batch_idx < 5:
+                print(f"ENTERED BATCH {batch_idx}")
             if batch_idx % 50 == 0:
                 print(f"Batch {batch_idx}/{len(loader)}")
             images = images.to(device, non_blocking=True)
