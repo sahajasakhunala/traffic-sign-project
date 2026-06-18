@@ -28,7 +28,7 @@ WARMUP_EPOCHS     = 3               # Linear warmup for stable early training
 VAL_SPLIT         = 0.15
 EARLY_STOP_PAT    = 10              # Patient — cosine LR improves late
 GRAD_CLIP         = 2.0             # Moderate clip
-NUM_WORKERS       = 2               # T4 Colab has enough CPU cores to feed GPU
+NUM_WORKERS       = 0               # T4 Colab has enough CPU cores to feed GPU
 SEED              = 42
 LABEL_SMOOTHING   = 0.05            # Mild smoothing — just enough for noisy labels
 MIXUP_ALPHA       = 0.2             # Gentle mixup — regularises without destroying signal
@@ -170,7 +170,7 @@ def build_loaders(
         batch_size  = BATCH_SIZE,
         num_workers = NUM_WORKERS,
         pin_memory  = (device.type == "cuda"),
-        persistent_workers = (NUM_WORKERS > 0),
+        persistent_workers = False,
     )
 
     if USE_WEIGHTED_SAMPLER:
