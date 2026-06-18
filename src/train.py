@@ -261,11 +261,19 @@ def run_epoch(
 
                 if use_mixup and MIXUP_ALPHA > 0:
                     mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
+                    print("DEBUG: About to run mixup forward")
                     outputs = model(mixed_images)
-                    loss    = mixed_criterion(criterion, outputs, y_a, y_b, lam)
+                    print("DEBUG: Mixup forward finished")
+
+                    loss = mixed_criterion(criterion, outputs, y_a, y_b, lam)
+                    print("DEBUG: Mixup loss computed")
                 else:
+                    print("DEBUG: About to run model forward")
                     outputs = model(images)
-                    loss    = criterion(outputs, labels)
+                    print("DEBUG: Model forward finished")
+
+                    loss = criterion(outputs, labels)
+                    print("DEBUG: Loss computed")
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
