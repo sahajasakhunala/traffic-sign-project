@@ -275,9 +275,13 @@ def run_epoch(
                     loss = criterion(outputs, labels)
                     print("DEBUG: Loss computed")
 
+                print("DEBUG: About to backward")
                 loss.backward()
+                print("DEBUG: Backward finished")
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                print("DEBUG: About to optimizer step")
                 optimizer.step()
+                print("DEBUG: Optimizer step finished")
 
                 # ── Accuracy on CLEAN inputs ──────────────────────────────────
                 # Run a quick forward on the original (un-mixed) images to get
