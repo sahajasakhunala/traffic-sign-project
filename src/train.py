@@ -180,6 +180,9 @@ def build_loaders(
         train_loader = DataLoader(train_set, shuffle=True, **_loader_kwargs)
 
     val_loader = DataLoader(val_set, shuffle=False, **_loader_kwargs)
+    
+    print("Train batches:", len(train_loader))
+    print("Val batches:", len(val_loader))
 
     print(f"  Dataset   : {data_dir}")
     print(f"  Classes   : {num_classes}")
@@ -229,7 +232,6 @@ def run_epoch(
     epoch:     int = 0,
     use_mixup: bool = False,
 ) -> tuple[float, float]:
-    print("DEBUG: Entered run_epoch")
     """
     One full pass over `loader`.  Pass optimizer=None for eval mode.
 
@@ -246,42 +248,27 @@ def run_epoch(
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        print("DEBUG: About to iterate loader")
         for batch_idx, (images, labels) in enumerate(loader):
-            if batch_idx == 0:
-                print("DEBUG: First batch received")
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            if batch_idx % 50 == 0:
+                print(f"Batch {batch_idx}/{len(loader)}")
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
             if batch_idx == 0:
-                print("DEBUG: Batch moved to GPU")
 
-            if training:
-                optimizer.zero_grad(set_to_none=True)
+                if training:
+                    optimizer.zero_grad(set_to_none=True)
 
-                if use_mixup and MIXUP_ALPHA > 0:
-                    mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
-                    print("DEBUG: About to run mixup forward")
-                    outputs = model(mixed_images)
-                    print("DEBUG: Mixup forward finished")
-
-                    loss = mixed_criterion(criterion, outputs, y_a, y_b, lam)
-                    print("DEBUG: Mixup loss computed")
-                else:
-                    print("DEBUG: About to run model forward")
-                    outputs = model(images)
-                    print("DEBUG: Model forward finished")
-
-                    loss = criterion(outputs, labels)
-                    print("DEBUG: Loss computed")
-
-                print("DEBUG: About to backward")
-                loss.backward()
-                print("DEBUG: Backward finished")
-                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                print("DEBUG: About to optimizer step")
-                optimizer.step()
-                print("DEBUG: Optimizer step finished")
+                    if use_mixup and MIXUP_ALPHA > 0:
+                        mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
+                        outputs = model(mixed_images)
+                        loss = mixed_criterion(criterion, outputs, y_a, y_b, lam)
+                    else:
+                        outputs = model(images)
+                        loss = criterion(outputs, labels)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                    optimizer.step()
 
                 # ── Accuracy on CLEAN inputs ──────────────────────────────────
                 # Run a quick forward on the original (un-mixed) images to get
