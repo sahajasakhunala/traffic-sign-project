@@ -258,8 +258,7 @@ def run_epoch(
                 print(images.device)
                 print(next(model.parameters()).device)
 
-            outputs = model(images) 
-            
+
             if batch_idx == 0:
 
                 if training:
@@ -267,14 +266,41 @@ def run_epoch(
 
                     if use_mixup and MIXUP_ALPHA > 0:
                         mixed_images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA, device)
+                        if batch_idx == 0:
+                            print("BEFORE FORWARD")
+
                         outputs = model(mixed_images)
+
+                        if batch_idx == 0:
+                            print("AFTER FORWARD")
                         loss = mixed_criterion(criterion, outputs, y_a, y_b, lam)
+                        if batch_idx == 0:
+                            print("AFTER LOSS")
                     else:
+                        if batch_idx == 0:
+                            print("BEFORE FORWARD")
+
                         outputs = model(images)
+
+                        if batch_idx == 0:
+                            print("AFTER FORWARD")
                         loss = criterion(outputs, labels)
+                        if batch_idx == 0:
+                            print("AFTER LOSS")
+
+                    if batch_idx == 0:
+                        print("BEFORE BACKWARD")
                     loss.backward()
+                    if batch_idx == 0:
+                        print("AFTER BACKWARD")
                     nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                    if batch_idx == 0:
+                        print("BEFORE OPT STEP")
+
                     optimizer.step()
+
+                    if batch_idx == 0:
+                        print("AFTER OPT STEP")
 
                 # ── Accuracy on CLEAN inputs ──────────────────────────────────
                 # Run a quick forward on the original (un-mixed) images to get
