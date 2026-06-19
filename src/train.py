@@ -43,8 +43,8 @@ CONF_MAT_CSV    = os.path.join(MODEL_DIR, "confusion_matrix.csv")
 PER_CLASS_CSV   = os.path.join(MODEL_DIR, "per_class_accuracy.csv")
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
-IMAGE_SIZE           = 96
-BATCH_SIZE           = 64       # fits T4 at 96×96; drop to 32 if you hit CUDA OOM
+IMAGE_SIZE           = 128
+BATCH_SIZE           = 64       # fits T4 at 128x128; drop to 32 if you hit CUDA OOM
 EPOCHS               = 40
 PHASE1_EPOCHS        = 5        # head-only warm-up (backbone frozen)
 LR_PHASE1            = 1e-3
@@ -131,7 +131,28 @@ def stratified_split(dataset, val_split, seed):
 def make_weighted_sampler(dataset):
     labels        = dataset.get_labels()
     class_counts  = collections.Counter(labels)
-    class_weights = {c: 1.0 / math.sqrt(n) for c, n in class_counts.items()}
+    
+    # 0.75 exponent gives stronger weight to rare classes than sqrt (0.50)
+    class_weights = {c: 1.0 / (n ** 0.75) for c, n in class_counts.items()}
+    
+    # Apply specific boost multipliers to specified rare class folders
+    try:
+        class_names = dataset.subset.dataset.classes
+        boost_map = {
+            "49": 5.0,  # critical rare class (~58 images)
+            "47": 2.5,  # level crossing countdown marker (~144 images)
+            "48": 2.5,  # level crossing countdown marker (~168 images)
+            "50": 2.5,  # level crossing countdown marker (~164 images)
+            "52": 2.5,  # bus stop (~140 images)
+        }
+        for folder_name, multiplier in boost_map.items():
+            if folder_name in class_names:
+                idx = class_names.index(folder_name)
+                if idx in class_weights:
+                    class_weights[idx] *= multiplier
+    except Exception as e:
+        print(f"Warning: Could not apply sampler class boosts ({e})")
+        
     sample_w      = [class_weights[l] for l in labels]
     return WeightedRandomSampler(weights=sample_w, num_samples=len(sample_w), replacement=True)
 
