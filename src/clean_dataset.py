@@ -144,4 +144,4 @@ def clean_dataset(data_dir, backup_dir=None, dry_run=True, min_size=16, min_std=
 if __name__ == "__main__":
     import sys
     src = "data/Indian_Dataset" if len(sys.argv) < 2 else sys.argv[1]
-    clean_dataset(src, dry_run=True)
+    clean_dataset(src, dry_run=False)
