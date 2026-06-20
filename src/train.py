@@ -45,13 +45,13 @@ PER_CLASS_CSV   = os.path.join(MODEL_DIR, "per_class_accuracy.csv")
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 IMAGE_SIZE           = 128
 BATCH_SIZE           = 64       # fits T4 at 128x128; drop to 32 if you hit CUDA OOM
-EPOCHS               = 40
+EPOCHS               = 60       # extended epochs for lower LR fine-tuning
 PHASE1_EPOCHS        = 5        # head-only warm-up (backbone frozen)
 LR_PHASE1            = 1e-3
-LR_PHASE2            = 5e-5
+LR_PHASE2            = 2e-5      # lower LR for delicate fine-tuning
 WEIGHT_DECAY         = 1e-4
 VAL_SPLIT            = 0.15
-EARLY_STOP_PAT       = 12
+EARLY_STOP_PAT       = 15       # increased patience for slow improvements
 GRAD_CLIP            = 2.0
 NUM_WORKERS          = 2
 SEED                 = 42
@@ -135,15 +135,21 @@ def make_weighted_sampler(dataset):
     # 0.75 exponent gives stronger weight to rare classes than sqrt (0.50)
     class_weights = {c: 1.0 / (n ** 0.75) for c, n in class_counts.items()}
     
-    # Apply specific boost multipliers to specified rare class folders
+    # Apply specific boost multipliers to specified hard class folders
     try:
         class_names = dataset.subset.dataset.classes
         boost_map = {
-            "49": 5.0,  # critical rare class (~58 images)
-            "47": 2.5,  # level crossing countdown marker (~144 images)
-            "48": 2.5,  # level crossing countdown marker (~168 images)
-            "50": 2.5,  # level crossing countdown marker (~164 images)
-            "52": 2.5,  # bus stop (~140 images)
+            "49": 6.0,  # Level crossing countdown marker (rarest: ~58 images)
+            "47": 3.0,  # Level crossing countdown marker (~144 images)
+            "48": 3.0,  # Level crossing countdown marker (~168 images)
+            "50": 3.0,  # Level crossing countdown marker (~164 images)
+            "23": 2.5,  # Turn left
+            "24": 2.5,  # Turn right
+            "36": 2.5,  # Side road junction
+            "37": 2.5,  # Side road junction
+            "42": 2.5,  # Staggered side road junction
+            "43": 2.5,  # Staggered side road junction
+            "52": 2.0,  # Bus stop
         }
         for folder_name, multiplier in boost_map.items():
             if folder_name in class_names:
@@ -213,6 +219,37 @@ def mixup_data(x, y, alpha):
 
 def mixed_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+# ── Focal Loss ─────────────────────────────────────────────────────────────────
+class FocalLoss(nn.Module):
+    """
+    Numerically stable multiclass Focal Loss.
+    FL(pt) = -alpha_t * (1 - pt)^gamma * log(pt)
+    """
+    def __init__(self, gamma=2.0, reduction="mean", label_smoothing=0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        logp = F.log_softmax(inputs, dim=-1)
+        pt = torch.exp(logp).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        logpt = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        
+        focal_weight = (1 - pt) ** self.gamma
+        loss = -focal_weight * logpt
+        
+        if self.label_smoothing > 0:
+            smooth_loss = -logp.mean(dim=-1)
+            loss = (1.0 - self.label_smoothing) * loss + self.label_smoothing * smooth_loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
 # ── AMP (Automatic Mixed Precision) ────────────────────────────────────────────
@@ -508,7 +545,7 @@ def main():
     print("-" * 72)
 
     model     = build_model(num_classes).to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    criterion = FocalLoss(gamma=2.0, label_smoothing=LABEL_SMOOTHING)
 
     print(f"  Backbone    : EfficientNet-B0 (ImageNet pretrained)")
     print(f"  Parameters  : {sum(p.numel() for p in model.parameters()):,}")
