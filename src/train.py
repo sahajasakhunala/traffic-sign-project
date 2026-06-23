@@ -34,9 +34,9 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR        = "/content/drive/MyDrive/TrafficSign/Indian-Traffic Sign-Dataset/Images"
+DATA_DIR = "/content/drive/MyDrive/TrafficSign/Indian-Traffic Sign-Dataset/Images_v2"
 MODEL_DIR       = "/content/drive/MyDrive/TrafficSign/models"
-MODEL_PATH      = os.path.join(MODEL_DIR, "efficientnet_b0_traffic_sign.pth")
+MODEL_PATH = os.path.join(MODEL_DIR, "efficientnet_b0_traffic_sign_v2.pth")
 LOG_PATH        = os.path.join(MODEL_DIR, "training_log.csv")
 CONF_MAT_PNG    = os.path.join(MODEL_DIR, "confusion_matrix.png")
 CONF_MAT_CSV    = os.path.join(MODEL_DIR, "confusion_matrix.csv")
@@ -139,10 +139,6 @@ def make_weighted_sampler(dataset):
     try:
         class_names = dataset.subset.dataset.classes
         boost_map = {
-            "49": 6.0,  # Level crossing countdown marker (rarest: ~58 images)
-            "47": 3.0,  # Level crossing countdown marker (~144 images)
-            "48": 3.0,  # Level crossing countdown marker (~168 images)
-            "50": 3.0,  # Level crossing countdown marker (~164 images)
             "23": 2.5,  # Turn left
             "24": 2.5,  # Turn right
             "36": 2.5,  # Side road junction
