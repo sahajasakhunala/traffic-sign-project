@@ -78,7 +78,6 @@ _STD  = [0.229, 0.224, 0.225]
 train_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE + 12, IMAGE_SIZE + 12)),
     transforms.RandomCrop(IMAGE_SIZE),
-    transforms.RandomHorizontalFlip(p=0.05),
     transforms.RandomRotation(degrees=15),
     transforms.RandomAffine(degrees=0, translate=(0.10, 0.10), scale=(0.88, 1.12), shear=6),
     transforms.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.30, hue=0.06),
@@ -131,6 +130,12 @@ def stratified_split(dataset, val_split, seed):
 def make_weighted_sampler(dataset):
     labels        = dataset.get_labels()
     class_counts  = collections.Counter(labels)
+    
+    print("\n===== CLASS COUNTS =====")
+    class_names = dataset.subset.dataset.classes
+
+    for idx, count in sorted(class_counts.items(), key=lambda x: x[1]):
+        print(f"{class_names[idx]:>4}: {count}")
     
     # 0.75 exponent gives stronger weight to rare classes than sqrt (0.50)
     class_weights = {c: 1.0 / (n ** 0.75) for c, n in class_counts.items()}
