@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR = "/content/drive/MyDrive/TrafficSign/Indian-Traffic Sign-Dataset/Images_v2"
+DATA_DIR = "/content/Images_v2"
 MODEL_DIR       = "/content/drive/MyDrive/TrafficSign/models"
 MODEL_PATH = os.path.join(MODEL_DIR, "efficientnet_b0_traffic_sign_v2.pth")
 LOG_PATH        = os.path.join(MODEL_DIR, "training_log.csv")
@@ -130,12 +130,6 @@ def stratified_split(dataset, val_split, seed):
 def make_weighted_sampler(dataset):
     labels        = dataset.get_labels()
     class_counts  = collections.Counter(labels)
-    
-    print("\n===== CLASS COUNTS =====")
-    class_names = dataset.subset.dataset.classes
-
-    for idx, count in sorted(class_counts.items(), key=lambda x: x[1]):
-        print(f"{class_names[idx]:>4}: {count}")
     
     # 0.75 exponent gives stronger weight to rare classes than sqrt (0.50)
     class_weights = {c: 1.0 / (n ** 0.75) for c, n in class_counts.items()}
